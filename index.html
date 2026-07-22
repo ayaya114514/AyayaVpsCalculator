@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="AyayaVpsCalculator：使用最新在线汇率计算 VPS 剩余时间、剩余价值与出让溢价。"
+    />
+    <meta name="theme-color" content="#111318" />
+    <title>AyayaVpsCalculator</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script defer src="./calculator.js"></script>
+    <script defer src="./app.js"></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="./" aria-label="AyayaVpsCalculator 首页">
+        <span>AyayaVpsCalculator</span>
+      </a>
+      <div class="header-status" id="compact-rate-status" aria-live="polite">
+        <span class="status-dot status-dot--loading"></span>
+        <span>正在连接汇率服务</span>
+      </div>
+    </header>
+
+    <main class="page-shell">
+      <div class="page-intro">
+        <h1 id="page-title">AyayaVpsCalculator</h1>
+      </div>
+
+      <section class="calculator-grid" aria-label="AyayaVpsCalculator">
+        <form class="panel form-panel" id="calculator-form">
+          <div class="panel-heading">
+            <h2>计算信息</h2>
+            <button class="text-button" id="reset-button" type="button">清空</button>
+          </div>
+
+          <div class="price-grid">
+            <div class="field price-field price-field--purchase">
+              <div class="field-label-row">
+                <span>购买 / 续费价格</span>
+              </div>
+              <div class="money-input">
+                <span class="money-symbol" id="purchase-symbol">$</span>
+                <input
+                  id="purchase-amount"
+                  name="purchaseAmount"
+                  type="number"
+                  min="0.01"
+                  step="0.01"
+                  inputmode="decimal"
+                  placeholder="100.00"
+                  required
+                />
+                <select id="purchase-currency" name="purchaseCurrency" aria-label="购买价格币种"></select>
+              </div>
+            </div>
+
+            <div class="field price-field price-field--transfer">
+              <div class="field-label-row">
+                <span id="transfer-label">出让价格</span>
+                <div class="mode-switch" role="group" aria-label="出让金额模式">
+                  <label><input type="radio" name="transferMode" value="transfer" checked /><span>出价</span></label>
+                  <label><input type="radio" name="transferMode" value="premium" /><span>溢价</span></label>
+                </div>
+              </div>
+              <div class="money-input">
+                <span class="money-symbol" id="transfer-symbol">¥</span>
+                <input
+                  id="transfer-amount"
+                  name="transferAmount"
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  inputmode="decimal"
+                  placeholder="选填"
+                />
+                <select id="target-currency" name="targetCurrency" aria-label="结果与出让价格币种"></select>
+              </div>
+            </div>
+          </div>
+
+          <fieldset class="field cycle-field">
+            <legend>续费周期</legend>
+            <div class="segmented" id="billing-options">
+              <label><input type="radio" name="billingCycle" value="1" /><span>月付</span></label>
+              <label><input type="radio" name="billingCycle" value="3" /><span>季付</span></label>
+              <label><input type="radio" name="billingCycle" value="6" /><span>半年付</span></label>
+              <label><input type="radio" name="billingCycle" value="12" checked /><span>年付</span></label>
+              <label><input type="radio" name="billingCycle" value="24" /><span>两年付</span></label>
+              <label><input type="radio" name="billingCycle" value="36" /><span>三年付</span></label>
+            </div>
+          </fieldset>
+
+          <div class="form-grid form-grid--two">
+            <label class="field">
+              <span>本周期开始日期</span>
+              <input id="purchase-date" name="purchaseDate" type="date" required />
+            </label>
+            <label class="field">
+              <span>到期日期 <small>自动计算</small></span>
+              <input id="expiry-date" name="expiryDate" type="date" readonly />
+            </label>
+          </div>
+
+          <p class="form-message" id="form-message" role="alert"></p>
+          <button class="primary-button" id="calculate-button" type="submit">
+            <span>计算剩余价值</span>
+            <span aria-hidden="true">→</span>
+          </button>
+        </form>
+
+        <aside class="panel result-panel" id="result-panel" aria-labelledby="result-title" hidden>
+          <div class="panel-heading">
+            <h2 id="result-title">计算结果</h2>
+            <span class="result-state" id="result-state">等待输入</span>
+          </div>
+
+          <div class="result-content" id="result-content">
+            <div class="result-highlight-grid">
+              <div class="result-card result-card--value">
+                <p class="result-kicker">当前剩余价值</p>
+                <h3 id="remaining-value">—</h3>
+                <p class="sub-value" id="original-remaining-value"></p>
+              </div>
+              <div class="result-card result-card--days">
+                <p class="result-kicker">剩余时间</p>
+                <p class="days-value"><strong id="remaining-days">0</strong><span> 天</span></p>
+              </div>
+            </div>
+
+            <div class="period-progress">
+              <div class="progress-track" aria-label="周期剩余比例">
+                <span id="remaining-progress"></span>
+              </div>
+              <div class="progress-labels">
+                <span id="period-start">—</span>
+                <strong id="remaining-percent">0%</strong>
+                <span id="period-end">—</span>
+              </div>
+            </div>
+
+            <dl class="result-list">
+              <div class="result-info-card result-info-card--purchase"><dt>购买 / 续费价格</dt><dd id="result-purchase-price">—</dd></div>
+              <div class="result-info-card result-info-card--period"><dt>计费周期</dt><dd id="result-billing-cycle">—</dd></div>
+              <div class="result-info-card result-info-card--transfer" id="transfer-price-row" hidden><dt>预计出让价格</dt><dd id="result-transfer-price">—</dd></div>
+              <div class="result-info-card result-info-card--premium" id="premium-row" hidden><dt>溢价 / 亏损</dt><dd id="result-premium">—</dd></div>
+            </dl>
+
+            <div class="rate-card">
+              <div>
+                <p>换算汇率</p>
+                <strong id="rate-pair">—</strong>
+                <small id="rate-time">—</small>
+              </div>
+              <button id="refresh-rates" type="button" aria-label="刷新汇率">刷新</button>
+            </div>
+
+            <div class="result-actions">
+              <button class="secondary-button" id="copy-button" type="button">复制 Markdown</button>
+            </div>
+          </div>
+        </aside>
+      </section>
+    </main>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>
