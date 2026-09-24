@@ -3,13 +3,20 @@ const {
   CURRENCIES,
   addMonthsClamped,
   calculateRemainingValue,
+  calculateTransfer,
   convertCurrency,
   formatCurrency,
+  hasCompleteRates,
+  isDateString,
+  parseExchangeRateApiRates,
+  parseFrankfurterRates,
 } = window.VpsCalculator;
 
-const RATE_CACHE_KEY = "ayaya-vps-rates-v1";
+const RATE_CACHE_KEY = "ayaya-vps-rates-v2";
 const RATE_CACHE_TTL = 6 * 60 * 60 * 1000;
+const RATE_FETCH_TIMEOUT = 8000;
 const CURRENCY_CODES = Object.keys(CURRENCIES);
+const FALLBACK_RATE_DATE = "2026-07-22";
 const FALLBACK_RATES = {
   USD: 1,
   CNY: 6.7646,
@@ -20,13 +27,30 @@ const FALLBACK_RATES = {
   SGD: 1.2907,
   HKD: 7.848,
 };
+const RATE_PROVIDERS = {
+  frankfurter: { name: "Frankfurter" },
+  "exchangerate-api": {
+    name: "ExchangeRate-API 备用",
+    // The open access endpoint requires this attribution link on pages that use its rates.
+    attribution: { text: "Rates By Exchange Rate API", href: "https://www.exchangerate-api.com" },
+  },
+  builtin: { name: "内置参考值" },
+};
+const RATE_MODES = {
+  online: { suffix: "", status: "online" },
+  cache: { suffix: "（缓存）", status: "online" },
+  stale: { suffix: "（过期缓存）", status: "offline" },
+  builtin: { suffix: "", status: "offline" },
+};
 
 const state = {
   rates: { ...FALLBACK_RATES },
-  rateDate: "2026-07-22",
-  rateSource: "内置参考值",
-  rateFetchedAt: 0,
-  hasCalculated: false,
+  rateDate: FALLBACK_RATE_DATE,
+  rateProvider: "builtin",
+  rateSource: RATE_PROVIDERS.builtin.name,
+  isLoadingRates: false,
+  lastCalculation: null,
+  isStale: false,
 };
 
 const elements = {};
@@ -47,17 +71,16 @@ function init() {
     transferSymbol: document.querySelector("#transfer-symbol"),
     transferLabel: document.querySelector("#transfer-label"),
     formMessage: document.querySelector("#form-message"),
-    compactRateStatus: document.querySelector("#compact-rate-status"),
+    rateStatus: document.querySelector("#rate-status"),
+    refreshRates: document.querySelector("#refresh-rates"),
     resultPanel: document.querySelector("#result-panel"),
-    resultContent: document.querySelector("#result-content"),
     resultState: document.querySelector("#result-state"),
     toast: document.querySelector("#toast"),
   });
 
   populateCurrencyOptions();
-  const today = getLocalDateString(new Date());
-  elements.purchaseDate.value = today;
-  elements.purchaseDate.max = today;
+  refreshDateLimits();
+  elements.purchaseDate.value = getLocalDateString(new Date());
   updateExpiryDate();
   updateSymbols();
   bindEvents();
@@ -68,20 +91,16 @@ function bindEvents() {
   elements.form.addEventListener("submit", handleSubmit);
   document.querySelector("#reset-button").addEventListener("click", resetForm);
   document.querySelector("#copy-button").addEventListener("click", copyMarkdown);
-  document.querySelector("#refresh-rates").addEventListener("click", () => loadExchangeRates(true));
+  elements.refreshRates.addEventListener("click", () => loadExchangeRates(true));
 
+  elements.purchaseDate.addEventListener("focus", refreshDateLimits);
   elements.purchaseDate.addEventListener("change", updateExpiryDate);
   document.querySelectorAll('input[name="billingCycle"]').forEach((input) => input.addEventListener("change", updateExpiryDate));
   elements.purchaseCurrency.addEventListener("change", updateSymbols);
   elements.targetCurrency.addEventListener("change", updateSymbols);
-
-  document.querySelectorAll('input[name="transferMode"]').forEach((input) => {
-    input.addEventListener("change", () => {
-      const isPremium = getTransferMode() === "premium";
-      elements.transferLabel.textContent = isPremium ? "溢价金额" : "出让价格";
-      elements.transferAmount.placeholder = isPremium ? "增加的金额" : "选填";
-      markResultStale();
-    });
+  document.querySelectorAll('input[name="transferMode"]').forEach((input) => input.addEventListener("change", syncTransferMode));
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") refreshDateLimits();
   });
 
   elements.form.querySelectorAll("input, select").forEach((input) => {
@@ -91,9 +110,9 @@ function bindEvents() {
 }
 
 function populateCurrencyOptions() {
-  const html = CURRENCY_CODES.map((code) => `<option value="${code}">${code} · ${CURRENCIES[code].name}</option>`).join("");
-  elements.purchaseCurrency.innerHTML = html;
-  elements.targetCurrency.innerHTML = html;
+  const options = CURRENCY_CODES.map((code) => new Option(`${code} · ${CURRENCIES[code].name}`, code));
+  elements.purchaseCurrency.replaceChildren(...options);
+  elements.targetCurrency.replaceChildren(...options.map((option) => option.cloneNode(true)));
   elements.purchaseCurrency.value = "USD";
   elements.targetCurrency.value = "CNY";
 }
@@ -101,80 +120,133 @@ function populateCurrencyOptions() {
 function updateSymbols() {
   elements.purchaseSymbol.textContent = CURRENCIES[elements.purchaseCurrency.value].symbol;
   elements.transferSymbol.textContent = CURRENCIES[elements.targetCurrency.value].symbol;
-  if (state.hasCalculated) updateDisplayedRate();
+}
+
+function syncTransferMode() {
+  const isPremium = getTransferMode() === "premium";
+  elements.transferLabel.textContent = isPremium ? "溢价金额" : "出让价格";
+  elements.transferAmount.placeholder = isPremium ? "增加的金额" : "选填";
+}
+
+function refreshDateLimits() {
+  elements.purchaseDate.max = getLocalDateString(new Date());
+}
+
+function getAutoExpiryDate() {
+  if (!elements.purchaseDate.value) return "";
+  return addMonthsClamped(elements.purchaseDate.value, getBillingMonths());
 }
 
 function updateExpiryDate() {
-  if (!elements.purchaseDate.value) return;
-  const months = Number(document.querySelector('input[name="billingCycle"]:checked').value);
-  elements.expiryDate.value = addMonthsClamped(elements.purchaseDate.value, months);
+  const expiry = getAutoExpiryDate();
+  if (expiry) elements.expiryDate.value = expiry;
 }
 
 async function loadExchangeRates(force = false) {
-  setRateStatus("loading", "正在获取最新汇率");
+  if (state.isLoadingRates) return;
   const cached = readRateCache();
-  if (!force && cached && Date.now() - cached.fetchedAt < RATE_CACHE_TTL) {
-    applyRates(cached.rates, cached.date, "本地缓存", cached.fetchedAt);
+  if (!force && cached && isCacheFresh(cached)) {
+    applyRates(cached, "cache");
     return;
   }
 
+  state.isLoadingRates = true;
+  setRefreshBusy(true);
+  setRateStatus("loading", "正在获取最新汇率");
   try {
-    const quotes = CURRENCY_CODES.filter((code) => code !== "USD").join(",");
-    const response = await fetch(`https://api.frankfurter.dev/v2/rates?base=USD&quotes=${quotes}`, { cache: "no-store" });
-    if (!response.ok) throw new Error(`Frankfurter ${response.status}`);
-    const rows = await response.json();
-    if (!Array.isArray(rows) || rows.length < CURRENCY_CODES.length - 1) throw new Error("Frankfurter 数据不完整");
-    const rates = { USD: 1 };
-    rows.forEach((row) => { rates[row.quote] = Number(row.rate); });
-    const fetchedAt = Date.now();
-    applyRates(rates, rows[0].date, "Frankfurter", fetchedAt);
-    writeRateCache({ rates, date: rows[0].date, fetchedAt });
+    const latest = await fetchLatestRates();
+    writeRateCache({ ...latest, fetchedAt: Date.now() });
+    applyRates(latest, "online", force);
+  } catch (error) {
+    console.warn("汇率服务暂不可用", error);
+    const fallback = readRateCache();
+    if (fallback) {
+      applyRates(fallback, isCacheFresh(fallback) ? "cache" : "stale", force, true);
+    } else {
+      applyRates({ rates: FALLBACK_RATES, date: FALLBACK_RATE_DATE, provider: "builtin" }, "builtin", force, true);
+    }
+  } finally {
+    state.isLoadingRates = false;
+    setRefreshBusy(false);
+  }
+}
+
+async function fetchLatestRates() {
+  const quotes = CURRENCY_CODES.filter((code) => code !== "USD").join(",");
+  try {
+    const rows = await fetchJson(`https://api.frankfurter.dev/v2/rates?base=USD&quotes=${quotes}`);
+    return { ...parseFrankfurterRates(rows, CURRENCY_CODES), provider: "frankfurter" };
   } catch (primaryError) {
     try {
-      const response = await fetch("https://open.er-api.com/v6/latest/USD", { cache: "no-store" });
-      if (!response.ok) throw new Error(`ExchangeRate-API ${response.status}`);
-      const data = await response.json();
-      const rates = Object.fromEntries(CURRENCY_CODES.map((code) => [code, Number(data.rates?.[code])]));
-      if (CURRENCY_CODES.some((code) => !Number.isFinite(rates[code]))) throw new Error("备用汇率数据不完整");
-      const fetchedAt = Date.now();
-      const date = new Date(data.time_last_update_unix * 1000).toISOString().slice(0, 10);
-      applyRates(rates, date, "ExchangeRate-API（备用）", fetchedAt);
-      writeRateCache({ rates, date, fetchedAt });
+      const data = await fetchJson("https://open.er-api.com/v6/latest/USD");
+      const parsed = parseExchangeRateApiRates(data, CURRENCY_CODES, getLocalDateString(new Date()));
+      return { ...parsed, provider: "exchangerate-api" };
     } catch (fallbackError) {
-      const staleCache = readRateCache();
-      if (staleCache) {
-        applyRates(staleCache.rates, staleCache.date, "过期缓存", staleCache.fetchedAt, true);
-      } else {
-        applyRates(FALLBACK_RATES, state.rateDate, "离线参考值", 0, true);
-      }
-      console.warn("汇率服务暂不可用", primaryError, fallbackError);
+      throw new AggregateError([primaryError, fallbackError], "汇率服务暂不可用");
     }
   }
 }
 
-function applyRates(rates, date, source, fetchedAt, isOffline = false) {
-  state.rates = rates;
+async function fetchJson(url) {
+  const signal = typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(RATE_FETCH_TIMEOUT) : undefined;
+  const response = await fetch(url, { cache: "no-store", signal });
+  if (!response.ok) throw new Error(`${new URL(url).host} ${response.status}`);
+  return response.json();
+}
+
+function applyRates({ rates, date, provider }, mode, announce = false, failed = false) {
+  const { suffix, status } = RATE_MODES[mode];
+  state.rates = { ...rates };
   state.rateDate = date;
-  state.rateSource = source;
-  state.rateFetchedAt = fetchedAt;
-  const message = isOffline ? `${source} · ${date}` : `${source} · ${date} 更新`;
-  setRateStatus(isOffline ? "offline" : "online", message);
-  if (state.hasCalculated) {
-    updateDisplayedRate();
-    showToast("汇率已刷新，请重新计算结果");
-    markResultStale();
+  state.rateProvider = provider;
+  state.rateSource = `${RATE_PROVIDERS[provider].name}${suffix}`;
+  setRateStatus(status, `${state.rateSource} · ${date}`, provider);
+
+  if (!state.lastCalculation) return;
+  const changed = getPairRate(state.lastCalculation.purchaseCurrency, state.lastCalculation.targetCurrency) !== state.lastCalculation.rate;
+  if (changed) markResultStale();
+  if (failed && (announce || changed)) {
+    showToast(`汇率服务暂不可用，使用${state.rateSource}`);
+  } else if (changed) {
+    showToast("汇率已更新，请重新计算");
+  } else if (announce) {
+    showToast("汇率已是最新");
   }
 }
 
-function setRateStatus(status, message) {
-  elements.compactRateStatus.innerHTML = `<span class="status-dot status-dot--${status}"></span><span>${message}</span>`;
+function setRateStatus(status, message, provider) {
+  const dot = document.createElement("span");
+  dot.className = `status-dot status-dot--${status}`;
+  const text = document.createElement("span");
+  text.textContent = message;
+  elements.rateStatus.replaceChildren(dot, text, ...createAttribution(provider));
+}
+
+function createAttribution(provider) {
+  const attribution = RATE_PROVIDERS[provider]?.attribution;
+  if (!attribution) return [];
+  const link = document.createElement("a");
+  link.href = attribution.href;
+  link.textContent = attribution.text;
+  link.target = "_blank";
+  link.rel = "noopener";
+  return [link];
+}
+
+function setRefreshBusy(isBusy) {
+  elements.refreshRates.disabled = isBusy;
+  elements.refreshRates.textContent = isBusy ? "刷新中" : "刷新";
+}
+
+function isCacheFresh(cache) {
+  return Date.now() - cache.fetchedAt < RATE_CACHE_TTL;
 }
 
 function readRateCache() {
   try {
     const data = JSON.parse(localStorage.getItem(RATE_CACHE_KEY));
-    if (!data?.rates || !data?.date || !data?.fetchedAt) return null;
-    if (CURRENCY_CODES.some((code) => !Number.isFinite(Number(data.rates[code])))) return null;
+    if (!data || !isDateString(data.date) || !Number.isFinite(data.fetchedAt)) return null;
+    if (!RATE_PROVIDERS[data.provider] || !hasCompleteRates(data.rates, CURRENCY_CODES)) return null;
     return data;
   } catch {
     return null;
@@ -199,17 +271,27 @@ function handleSubmit(event) {
       today: getLocalDateString(new Date()),
     });
     const convertedValue = convertCurrency(result.value, purchaseCurrency, targetCurrency, state.rates);
-    renderResult({ ...result, amount, convertedValue, purchaseCurrency, targetCurrency });
+    renderResult({
+      ...result,
+      amount,
+      convertedValue,
+      purchaseCurrency,
+      targetCurrency,
+      rate: getPairRate(purchaseCurrency, targetCurrency),
+      rateDate: state.rateDate,
+      rateSource: state.rateSource,
+      rateProvider: state.rateProvider,
+    });
   } catch (error) {
     elements.formMessage.textContent = error.message || "暂时无法完成计算，请检查输入";
   }
 }
 
 function renderResult(result) {
-  const { amount, value, convertedValue, ratio, remainingDays, purchaseCurrency, targetCurrency } = result;
-  const months = document.querySelector('input[name="billingCycle"]:checked').value;
+  const { amount, value, convertedValue, ratio, remainingDays, totalDays, purchaseCurrency, targetCurrency } = result;
+  const months = getBillingMonths();
+  const isAutoExpiry = elements.expiryDate.value === getAutoExpiryDate();
   const transferAmount = elements.transferAmount.value === "" ? null : Number(elements.transferAmount.value);
-  const transferMode = getTransferMode();
 
   document.querySelector("#remaining-value").textContent = formatCurrency(convertedValue, targetCurrency);
   document.querySelector("#original-remaining-value").textContent = purchaseCurrency === targetCurrency ? "" : `原币约 ${formatCurrency(value, purchaseCurrency)}`;
@@ -219,15 +301,14 @@ function renderResult(result) {
   document.querySelector("#period-start").textContent = formatShortDate(elements.purchaseDate.value);
   document.querySelector("#period-end").textContent = formatShortDate(elements.expiryDate.value);
   document.querySelector("#result-purchase-price").textContent = formatCurrency(amount, purchaseCurrency);
-  document.querySelector("#result-billing-cycle").textContent = `${BILLING_LABELS[months]} · ${result.totalDays} 天`;
+  document.querySelector("#result-billing-cycle").textContent = `${isAutoExpiry ? BILLING_LABELS[months] : "自定义"} · ${totalDays} 天`;
 
   const transferRow = document.querySelector("#transfer-price-row");
   const premiumRow = document.querySelector("#premium-row");
   if (transferAmount !== null && Number.isFinite(transferAmount) && transferAmount >= 0) {
-    const finalTransferPrice = transferMode === "premium" ? convertedValue + transferAmount : transferAmount;
-    const premium = finalTransferPrice - convertedValue;
+    const { finalPrice, premium } = calculateTransfer({ value: convertedValue, amount: transferAmount, mode: getTransferMode(), currency: targetCurrency });
     const premiumElement = document.querySelector("#result-premium");
-    document.querySelector("#result-transfer-price").textContent = formatCurrency(finalTransferPrice, targetCurrency);
+    document.querySelector("#result-transfer-price").textContent = formatCurrency(finalPrice, targetCurrency);
     premiumElement.textContent = `${premium > 0 ? "+" : premium < 0 ? "−" : ""}${formatCurrency(Math.abs(premium), targetCurrency)} · ${premium > 0 ? "溢价" : premium < 0 ? "亏损" : "持平"}`;
     premiumElement.className = premium > 0 ? "positive" : premium < 0 ? "negative" : "";
     transferRow.hidden = false;
@@ -237,29 +318,33 @@ function renderResult(result) {
     premiumRow.hidden = true;
   }
 
-  updateDisplayedRate();
+  document.querySelector("#rate-pair").textContent = `1 ${purchaseCurrency} = ${formatRate(result.rate)} ${targetCurrency}`;
+  const rateTime = document.createElement("span");
+  rateTime.textContent = `${result.rateDate} · ${result.rateSource}`;
+  document.querySelector("#rate-time").replaceChildren(rateTime, ...createAttribution(result.rateProvider));
+
   elements.resultPanel.hidden = false;
-  elements.resultContent.hidden = false;
   elements.resultState.textContent = "已计算";
   elements.resultState.className = "result-state result-state--ready";
-  state.hasCalculated = true;
+  state.lastCalculation = result;
+  state.isStale = false;
 
   if (window.matchMedia("(max-width: 900px)").matches) {
     elements.resultPanel.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 }
 
-function updateDisplayedRate() {
-  const from = elements.purchaseCurrency.value;
-  const to = elements.targetCurrency.value;
-  let rate = 1;
-  try { rate = convertCurrency(1, from, to, state.rates); } catch { /* Keep neutral rate label. */ }
-  document.querySelector("#rate-pair").textContent = `1 ${from} = ${formatRate(rate)} ${to}`;
-  document.querySelector("#rate-time").textContent = `${state.rateDate} · ${state.rateSource}`;
+function getPairRate(from, to) {
+  try {
+    return convertCurrency(1, from, to, state.rates);
+  } catch {
+    return Number.NaN;
+  }
 }
 
 function markResultStale() {
-  if (!state.hasCalculated) return;
+  if (!state.lastCalculation) return;
+  state.isStale = true;
   elements.resultState.textContent = "待重新计算";
   elements.resultState.className = "result-state result-state--stale";
 }
@@ -268,19 +353,29 @@ function resetForm() {
   elements.form.reset();
   elements.purchaseCurrency.value = "USD";
   elements.targetCurrency.value = "CNY";
+  refreshDateLimits();
   elements.purchaseDate.value = getLocalDateString(new Date());
   updateExpiryDate();
   updateSymbols();
+  syncTransferMode();
   elements.formMessage.textContent = "";
   elements.resultPanel.hidden = true;
   elements.resultState.textContent = "等待输入";
   elements.resultState.className = "result-state";
-  state.hasCalculated = false;
+  state.lastCalculation = null;
+  state.isStale = false;
   showToast("已清空输入");
 }
 
 async function copyMarkdown() {
-  const rows = Array.from(document.querySelectorAll("#result-content .result-list div:not([hidden])")).map((row) => {
+  const calculation = state.lastCalculation;
+  if (!calculation) return;
+  if (state.isStale) {
+    showToast("结果待重新计算，请先计算再复制");
+    return;
+  }
+
+  const rows = Array.from(document.querySelectorAll("#result-panel .result-list div:not([hidden])")).map((row) => {
     const label = row.querySelector("dt").textContent;
     const value = row.querySelector("dd").textContent;
     return `| ${label} | ${value} |`;
@@ -291,10 +386,10 @@ async function copyMarkdown() {
     "| 项目 | 结果 |",
     "| --- | --- |",
     `| 当前剩余价值 | ${document.querySelector("#remaining-value").textContent} |`,
-    `| 剩余时间 | ${document.querySelector("#remaining-days").textContent} 天 |`,
+    `| 剩余时间 | ${calculation.remainingDays} 天 |`,
     ...rows,
     `| 换算汇率 | ${document.querySelector("#rate-pair").textContent} |`,
-    `| 汇率日期 | ${state.rateDate}（${state.rateSource}） |`,
+    `| 汇率日期 | ${calculation.rateDate}（${calculation.rateSource}） |`,
   ].join("\n");
 
   try {
@@ -303,6 +398,10 @@ async function copyMarkdown() {
   } catch {
     showToast("复制失败，请检查浏览器权限");
   }
+}
+
+function getBillingMonths() {
+  return Number(document.querySelector('input[name="billingCycle"]:checked').value);
 }
 
 function getTransferMode() {
@@ -321,6 +420,7 @@ function formatShortDate(date) {
 }
 
 function formatRate(rate) {
+  if (!Number.isFinite(rate)) return "—";
   if (rate >= 100) return rate.toFixed(2);
   if (rate >= 1) return rate.toFixed(4);
   return rate.toFixed(6);
