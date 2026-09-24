@@ -7,12 +7,12 @@
   }
 }(typeof globalThis !== "undefined" ? globalThis : window, function createCalculator() {
   const CURRENCIES = {
-    USD: { name: "美元", symbol: "$", fractionDigits: 2 },
+    USD: { name: "美元", symbol: "US$", fractionDigits: 2 },
     CNY: { name: "人民币", symbol: "¥", fractionDigits: 2 },
     GBP: { name: "英镑", symbol: "£", fractionDigits: 2 },
     EUR: { name: "欧元", symbol: "€", fractionDigits: 2 },
     CAD: { name: "加元", symbol: "C$", fractionDigits: 2 },
-    JPY: { name: "日元", symbol: "¥", fractionDigits: 0 },
+    JPY: { name: "日元", symbol: "JP¥", fractionDigits: 0 },
     SGD: { name: "新加坡元", symbol: "S$", fractionDigits: 2 },
     HKD: { name: "港元", symbol: "HK$", fractionDigits: 2 },
   };
@@ -75,15 +75,70 @@
     return (Number(amount) / fromRate) * toRate;
   }
 
+  function roundCurrency(amount, currency) {
+    const digits = CURRENCIES[currency]?.fractionDigits ?? 2;
+    // Round with Intl so the stored value always matches what formatCurrency displays.
+    const text = new Intl.NumberFormat("en-US", {
+      useGrouping: false,
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    }).format(Number(amount));
+    return Number(text) || 0;
+  }
+
   function formatCurrency(amount, currency, locale = "zh-CN") {
     const config = CURRENCIES[currency];
-    if (!config || !Number.isFinite(Number(amount))) return "—";
-    return new Intl.NumberFormat(locale, {
-      style: "currency",
-      currency,
+    const number = Number(amount);
+    if (!config || !Number.isFinite(number)) return "—";
+    const rounded = roundCurrency(number, currency);
+    const digits = new Intl.NumberFormat(locale, {
       minimumFractionDigits: config.fractionDigits,
       maximumFractionDigits: config.fractionDigits,
-    }).format(Number(amount));
+    }).format(Math.abs(rounded));
+    return `${rounded < 0 ? "−" : ""}${config.symbol}${digits}`;
+  }
+
+  function calculateTransfer({ value, amount, mode, currency }) {
+    const roundedValue = roundCurrency(value, currency);
+    const input = roundCurrency(amount, currency);
+    const finalPrice = mode === "premium" ? roundCurrency(roundedValue + input, currency) : input;
+    return { finalPrice, premium: roundCurrency(finalPrice - roundedValue, currency) };
+  }
+
+  function hasCompleteRates(rates, codes) {
+    return codes.every((code) => {
+      const rate = Number(rates?.[code]);
+      return Number.isFinite(rate) && rate > 0;
+    });
+  }
+
+  function isDateString(value) {
+    return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
+  }
+
+  function parseFrankfurterRates(rows, codes) {
+    if (!Array.isArray(rows)) throw new Error("Frankfurter 数据格式无效");
+    const rates = { USD: 1 };
+    let date = "";
+    rows.forEach((row) => {
+      if (!codes.includes(row?.quote) || row.base !== "USD") return;
+      rates[row.quote] = Number(row.rate);
+      if (isDateString(row.date) && row.date > date) date = row.date;
+    });
+    if (!hasCompleteRates(rates, codes)) throw new Error("Frankfurter 数据不完整");
+    if (!date) throw new Error("Frankfurter 缺少汇率日期");
+    return { rates, date };
+  }
+
+  function parseExchangeRateApiRates(data, codes, fallbackDate) {
+    if (data?.result !== "success") throw new Error("ExchangeRate-API 返回失败");
+    const rates = Object.fromEntries(codes.map((code) => [code, Number(data.rates?.[code])]));
+    if (!hasCompleteRates(rates, codes)) throw new Error("备用汇率数据不完整");
+    const updatedAt = Number(data.time_last_update_unix);
+    const date = Number.isFinite(updatedAt) && updatedAt > 0
+      ? new Date(updatedAt * 1000).toISOString().slice(0, 10)
+      : fallbackDate;
+    return { rates, date };
   }
 
   return {
@@ -91,9 +146,15 @@
     CURRENCIES,
     addMonthsClamped,
     calculateRemainingValue,
+    calculateTransfer,
     convertCurrency,
     formatCurrency,
     formatDateInput,
+    hasCompleteRates,
+    isDateString,
+    parseExchangeRateApiRates,
+    parseFrankfurterRates,
+    roundCurrency,
     toEpochDay,
   };
 }));

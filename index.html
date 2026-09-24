@@ -9,24 +9,22 @@
     />
     <meta name="theme-color" content="#111318" />
     <title>AyayaVpsCalculator</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="./styles.css" />
     <script defer src="./calculator.js"></script>
     <script defer src="./app.js"></script>
   </head>
   <body>
-    <header class="site-header">
-      <a class="brand" href="./" aria-label="AyayaVpsCalculator 首页">
-        <span>AyayaVpsCalculator</span>
-      </a>
-      <div class="header-status" id="compact-rate-status" aria-live="polite">
-        <span class="status-dot status-dot--loading"></span>
-        <span>正在连接汇率服务</span>
-      </div>
-    </header>
-
     <main class="page-shell">
       <div class="page-intro">
-        <h1 id="page-title">AyayaVpsCalculator</h1>
+        <h1 id="page-title">
+          <img class="brand-mark" src="./favicon.svg" alt="" width="40" height="40" />
+          <span>AyayaVpsCalculator</span>
+        </h1>
+        <div class="rate-status" id="rate-status" aria-live="polite">
+          <span class="status-dot status-dot--loading"></span>
+          <span>正在连接汇率服务</span>
+        </div>
       </div>
 
       <section class="calculator-grid" aria-label="AyayaVpsCalculator">
@@ -99,8 +97,8 @@
               <input id="purchase-date" name="purchaseDate" type="date" required />
             </label>
             <label class="field">
-              <span>到期日期 <small>自动计算</small></span>
-              <input id="expiry-date" name="expiryDate" type="date" readonly />
+              <span>到期日期 <small>自动填写，可修改</small></span>
+              <input id="expiry-date" name="expiryDate" type="date" required />
             </label>
           </div>
 
@@ -117,7 +115,7 @@
             <span class="result-state" id="result-state">等待输入</span>
           </div>
 
-          <div class="result-content" id="result-content">
+          <div class="result-content">
             <div class="result-highlight-grid">
               <div class="result-card result-card--value">
                 <p class="result-kicker">当前剩余价值</p>
